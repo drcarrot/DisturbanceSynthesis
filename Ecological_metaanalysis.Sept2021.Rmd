@@ -1,0 +1,1159 @@
+---
+title: "Disturbance and recovery: a synthesis of microbial community assembly following disturbance across realms"
+output: html_notebook
+  toc: true
+  toc_float: true
+  toc_collapsed: true
+---
+#Load packages and functions
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#setwd( "/data/sj40zura/Homogenize/")
+
+suppressPackageStartupMessages(lapply(c('plyr','ggfortify', 'psych','msa','viridis', 'ggplot2','RColorBrewer', 'reshape2', 'ape', 'phyloseq', 'vegan', 'cowplot', 'dplyr', 'gplots', 'dada2', 'phangorn', 'data.table', 'hillR', 'betapart', 'metamicrobiomeR', 'tidyverse', 'Carrotworks'), require,character.only=TRUE)) #add as necessary
+
+
+#Function from metagMisc https://github.com/vmikk/metagMisc/
+phyloseq_sep_variable <- function(physeq, variable, drop_zeroes = T){
+    
+    # require(phyloseq)
+    # require(plyr)
+
+    ## Check the input
+    if(is.null(phyloseq::sample_data(physeq, errorIfNULL = F))){
+        stop("Sample data is missing in the phyloseq-object.\n")
+    }
+
+    ## Extract samle meta-data
+    mtd <- as(object = phyloseq::sample_data(physeq), Class = "data.frame")
+
+    if(!variable %in% colnames(mtd)){
+        stop("Grouping variable is missing from the sample data of phyloseq-object.\n")
+    }
+
+    if(class(mtd[, variable]) %in% c("integer", "numeric") ){
+        if( length( unique(mtd[, variable]) ) > 5){
+          stop("Groupping variable is numeric and it has too many levels. Consider transforming it to factor.\n")
+        } else {
+          warning("Groupping variable is numeric and it was coerced to factor.\n")
+          mtd[, variable] <- factor(mtd[, variable])
+        }
+    }
+
+    if(length(table(mtd[, variable])) == 1){
+        cat("Warning: there is only one group of samples in the resulting list.\n")
+    }
+
+    ## Add sample IDs to the meta-data
+    smp <- data.frame(
+        SID = phyloseq::sample_names(physeq),
+        mtd,
+        stringsAsFactors = F)
+
+    ## Exatract sample names by the specified variable
+    svv <- plyr::dlply(.data = smp, .variables = variable, .fun = function(z){ z$SID })
+
+    ## Extract samples by groupping variable
+    res <- plyr::llply(.data = svv, .fun = function(z){ phyloseq::prune_samples(z, x = physeq) })
+
+    ## Remove taxa with zero abundance
+    if(drop_zeroes == TRUE){
+        res <- plyr::llply(.data = res, .fun = function(x){ phyloseq::prune_taxa(phyloseq::taxa_sums(x) > 0, x) })
+    }
+
+    return(res)
+}
+
+
+```
+
+#Look into sequencing quality
+```{r}
+files <- list.files(path="Tracking_table/",pattern="tracking_table.txt")
+tracking_all= NULL
+for (f in files) {
+   dat <- read.table(paste0("Tracking_table/",f), header=T, sep="\t", na.strings="")
+   if (levels(dat$study)=="study"){dat$study=strsplit(f, split = "_")[[1]][1]} #REMOVE _tracking_table.txt
+   tracking_all <- rbind(tracking_all, dat)
+}
+
+tracking_all$ratio=tracking_all$Filtered.Reads/tracking_all$Original.Reads
+tracking_all$ratio2=tracking_all$Non.chimeric.Reads/tracking_all$Original.Reads
+tracking_all$ratio3=tracking_all$pseq/tracking_all$Original.Reads
+
+plot1=ggplot(tracking_all, aes(x=study, y=ratio))+
+  geom_boxplot()+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),axis.title.x=element_blank())+
+  ylim(0,1)+
+  ylab("Reads conserved after Filtering")
+
+plot2=ggplot(tracking_all, aes(x=study, y=ratio2))+
+  geom_boxplot()+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),axis.title.x=element_blank())+
+  ylim(0,1)+
+  ylab("Reads conserved after Chimera Checking")
+
+plot3=ggplot(tracking_all, aes(x=study, y=ratio3))+
+  geom_boxplot()+
+  ylab("Proportion Bacterial, high-quality reads")+
+  ylim(0,1)+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot1
+plot2
+plot3
+
+plot_grid(plot1, plot2, plot3,  label_size = 12, nrow=3)
+
+```
+
+#Load all phyloseq objects, 
+Exclude phylogenetic tree and add metadata. Split studies in which controls are used for multiple disturbances. In this case, rename samples.
+```{r message=TRUE, warning=TRUE, include=FALSE}
+
+Datta=readRDS("Data/Datta.merged.rds")
+Datta.m=read.table("Data/Datta_Meta_TimeRounded.txt", sep="\t", row.names=1, header=TRUE)
+sample_names(Datta)=substr(sample_names(Datta), 1,10)
+Datta=phyloseq(Datta@otu_table, Datta@tax_table, Datta@sam_data)
+Datta@sam_data=sample_data(Datta.m)
+Datta=prune_samples(Datta@sam_data$Keep!="FALSE" &Datta@sam_data$Disturbance!="Control", Datta)
+if (min(sample_sums(Datta))<1500){
+  Datta=rarefy_even_depth(Datta, 1500, rngseed = 1)
+  } else {
+    Datta=rarefy_even_depth(Datta, min(sample_sums(Datta)), rngseed = 1)}
+Datta@sam_data$Time_since_dist=cut(Datta@sam_data$Time_since_dist,breaks = (c(-Inf,-0.01,0.4,1.4,2.4,3.4,4.4,5.4,Inf)), labels=c(-1,0,1,2,3,4,5,6)) #Wrangle this dataset into daily categories given the daily nature of the rest of the datasets. If there is criticism, remove.
+Datta@sam_data$Time_since_dist=as.numeric(as.character(Datta@sam_data$Time_since_dist))
+
+David=readRDS("Data/David.merged.rds")
+David.m=read.table("Data/David_Meta.txt", sep="\t", row.names=1, header=TRUE)
+David.m=David.m[match(sample_names(David), rownames(David.m)),]
+David=phyloseq(David@otu_table, David@tax_table, David@sam_data)
+David@sam_data=sample_data(David.m)
+David=subset_samples(David,David@sam_data$Keep!="FALSE"&David@sam_data$Disturbance!="Control")
+if (min(sample_sums(David))<1500){
+  David=rarefy_even_depth(David, 1500, rngseed = 1)
+  } else {
+    David=rarefy_even_depth(David, min(sample_sums(David)), rngseed = 1)}
+David@sam_data$Time_since_dist=as.numeric(as.character(David@sam_data$Time_since_dist))
+David@sam_data$Time_since_dist=cut(David@sam_data$Time_since_dist,breaks = (c(-Inf,0.01,4,22,40,100,Inf)), labels=c(0,1,7,30,90,180)) #Wrangle this dataset into categories for replicates, given the nature of sampling humans
+David@sam_data$Time_since_dist=as.numeric(as.character(David@sam_data$Time_since_dist))
+
+deVries=readRDS("Data/deVries.merged.rds")
+sample_names(deVries)=substr(sample_names(deVries), 1,4)
+deVries.m=read.table("Data/deVries_Meta.txt", sep="\t", row.names=1, header=TRUE)
+deVries=phyloseq(deVries@otu_table, deVries@tax_table, deVries@sam_data)
+deVries@sam_data=sample_data(deVries.m)
+deVries=subset_samples(deVries,deVries@sam_data$Keep!="FALSE"&deVries@sam_data$Disturbance!="Control")
+if (min(sample_sums(deVries))<1500){
+  deVries=rarefy_even_depth(deVries, 1500, rngseed = 1)
+  } else {
+    deVries=rarefy_even_depth(deVries, min(sample_sums(deVries)), rngseed = 1)}
+deVries@sam_data$Time_since_dist=as.numeric(deVries@sam_data$Time_since_dist)
+
+Dong=readRDS("Data/Dong.merged.rds")
+Dong=phyloseq(Dong@otu_table, Dong@tax_table, Dong@sam_data)#Remove the phylogenetic tree basically
+Dong.m=read.table("Data/Dong_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Dong=phyloseq(Dong@otu_table, Dong@tax_table, Dong@sam_data)
+Dong@sam_data=sample_data(Dong.m)
+Dong=subset_samples(Dong,Dong@sam_data$Keep!="FALSE"&Dong@sam_data$Disturbance!="Control")
+if (min(sample_sums(Dong))<1500){
+  Dong=rarefy_even_depth(Dong, 1500, rngseed = 1)
+  } else {
+    Dong=rarefy_even_depth(Dong, min(sample_sums(Dong)), rngseed = 1)}
+Dong@sam_data$Time_since_dist=as.numeric(Dong@sam_data$Time_since_dist)
+
+Dzunkova=readRDS("Data/Dzunkova.merged.rds")
+Dzunkova.m=read.table("Data/Dzunkova_Meta.txt", sep="\t", row.names=1, header=TRUE)
+#sample_names(Dzunkova)=substr(sample_names(Dzunkova), 1,10)
+#sample_names(Dzunkova)=gsub("_", "", sample_names(Dzunkova))
+Dzunkova@sam_data=sample_data(Dzunkova.m)
+Dzunkova=phyloseq(Dzunkova@otu_table, Dzunkova@tax_table, Dzunkova@sam_data)
+Dzunkova=prune_samples(Dzunkova@sam_data$Keep!="FALSE"&Dzunkova@sam_data$Disturbance!="Control", Dzunkova)
+if (min(sample_sums(Dzunkova))<1500){
+  Dzunkova=rarefy_even_depth(Dzunkova, 1500, rngseed = 1)
+  } else {
+    Dzunkova=rarefy_even_depth(Dzunkova, min(sample_sums(Dzunkova)), rngseed = 1)}
+Dzunkova@sam_data$Time_since_dist=as.numeric(Dzunkova@sam_data$Time_since_dist)
+
+Flancman=readRDS("Data/Flancman.merged.rds")
+Flancman.m=read.table("Data/Flancman_Meta.txt", sep="\t", row.names=1, header=TRUE)
+sample_names(Flancman)=substr(sample_names(Flancman), 1,10)
+sample_names(Flancman)=gsub("_", "", sample_names(Flancman))
+Flancman@sam_data=sample_data(Flancman.m)
+Flancman=phyloseq(Flancman@otu_table, Flancman@tax_table, Flancman@sam_data)
+Flancman=prune_samples(Flancman@sam_data$Keep!="FALSE"&Flancman@sam_data$Disturbance!="Control", Flancman)
+if (min(sample_sums(Flancman))<1500){
+  Flancman=rarefy_even_depth(Flancman, 1500, rngseed = 1)
+  } else {
+    Flancman=rarefy_even_depth(Flancman, min(sample_sums(Flancman)), rngseed = 1)}
+Flancman@sam_data$Time_since_dist=as.numeric(Flancman@sam_data$Time_since_dist)
+
+Frenk=readRDS("Data/Frenk.merged.rds")
+Frenk.m=read.table("Data/Frenk_Meta.txt", sep="\t", row.names=1, header=TRUE)
+sample_names(Frenk)=substr(sample_names(Frenk), 1,10)
+Frenk@sam_data=sample_data(Frenk.m)
+Frenk=phyloseq(Frenk@otu_table, Frenk@tax_table, Frenk@sam_data)
+Frenk=prune_samples(Frenk@sam_data$Keep!="FALSE"&Frenk@sam_data$Disturbance!="Control", Frenk)
+if (min(sample_sums(Frenk))<1500){
+  Frenk=rarefy_even_depth(Frenk, 1500, rngseed = 1)
+  } else {
+    Frenk=rarefy_even_depth(Frenk, min(sample_sums(Frenk)), rngseed = 1)}
+Frenk@sam_data$Time_since_dist=as.numeric(Frenk@sam_data$Time_since_dist)
+
+Fuentes=readRDS("Data/Fuentes.merged.rds")
+if (min(sample_sums(Fuentes))<1500){
+  Fuentes=rarefy_even_depth(Fuentes, 1500, rngseed = 1)
+  } else {
+    Fuentes=rarefy_even_depth(Fuentes, min(sample_sums(Fuentes)), rngseed = 1)}
+Fuentes_Bact1.m=read.table("Data/Fuentes_Diesel_Bact1_Meta.txt", sep="\t", row.names=1,header=TRUE)
+Fuentes_Bact1=Fuentes
+Fuentes_Bact1@sam_data=sample_data(Fuentes_Bact1.m)
+Fuentes_Bact1=phyloseq(Fuentes_Bact1@otu_table, Fuentes_Bact1@tax_table, Fuentes_Bact1@sam_data)
+Fuentes_Bact1=prune_samples(Fuentes_Bact1@sam_data$Keep!="FALSE"&Fuentes_Bact1@sam_data$Disturbance!="Control", Fuentes_Bact1)
+Fuentes_Bact1@sam_data$Time_since_dist=as.numeric(Fuentes_Bact1@sam_data$Time_since_dist)
+sample_names(Fuentes_Bact1) <- paste0("Fuentes.Bact1",1:nsamples(Fuentes_Bact1))
+
+Fuentes_Bact2.m=read.table("Data/Fuentes_Diesel_Bact2_Meta.txt", sep="\t", row.names=1,header=TRUE)
+Fuentes_Bact2=Fuentes
+Fuentes_Bact2@sam_data=sample_data(Fuentes_Bact2.m)
+Fuentes_Bact2=phyloseq(Fuentes_Bact2@otu_table, Fuentes_Bact2@tax_table, Fuentes_Bact2@sam_data)
+Fuentes_Bact2=prune_samples(Fuentes_Bact2@sam_data$Keep!="FALSE"&Fuentes_Bact2@sam_data$Disturbance!="Control", Fuentes_Bact2)
+Fuentes_Bact2@sam_data$Time_since_dist=as.numeric(Fuentes_Bact2@sam_data$Time_since_dist)
+sample_names(Fuentes_Bact2) <- paste0("Fuentes.Bact2",1:nsamples(Fuentes_Bact2))
+
+Fuentes_Diesel.m=read.table("Data/Fuentes_Diesel_Pollution_Meta.txt", sep="\t", row.names=1,header=TRUE)
+Fuentes_Diesel=Fuentes
+Fuentes_Diesel@sam_data=sample_data(Fuentes_Diesel.m)
+Fuentes_Diesel=phyloseq(Fuentes_Diesel@otu_table, Fuentes_Diesel@tax_table, Fuentes_Diesel@sam_data)
+Fuentes_Diesel=prune_samples(Fuentes_Diesel@sam_data$Keep!="FALSE"&Fuentes_Diesel@sam_data$Disturbance!="Control", Fuentes_Diesel)
+Fuentes_Diesel@sam_data$Time_since_dist=as.numeric(Fuentes_Diesel@sam_data$Time_since_dist)
+sample_names(Fuentes_Diesel) <- paste0("Fuentes.Diesel",1:nsamples(Fuentes_Diesel))
+
+Ho=readRDS("Data/Ho.merged.rds")
+if (min(sample_sums(Ho))<1500){
+  Ho=rarefy_even_depth(Ho, 1500, rngseed = 1)
+  } else {
+    Ho=rarefy_even_depth(Ho, min(sample_sums(Ho)), rngseed = 1)}
+Ho.Aquatic.Plant.Material.m=read.table("Data/Ho_Aquatic_Plant_Material_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Ho.Aquatic.Plant.Material.m=Ho.Aquatic.Plant.Material.m[match(sample_names(Ho), rownames(Ho.Aquatic.Plant.Material.m)),]
+Ho.Aquatic.Plant.Material=Ho
+Ho.Aquatic.Plant.Material@sam_data=sample_data(Ho.Aquatic.Plant.Material.m)
+Ho.Aquatic.Plant.Material=subset_samples(Ho.Aquatic.Plant.Material,Ho.Aquatic.Plant.Material@sam_data$Keep!="FALSE"&Ho.Aquatic.Plant.Material@sam_data$Disturbance!="Control")
+sample_names(Ho.Aquatic.Plant.Material) <- paste0("Ho.Aquatic.Plant.Material",1:nsamples(Ho.Aquatic.Plant.Material))
+Ho.Aquatic.Plant.Material@sam_data$Time_since_dist=as.numeric(Ho.Aquatic.Plant.Material@sam_data$Time_since_dist)
+
+Ho.Compost.m=read.table("Data/Ho_Compost_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Ho.Compost.m=Ho.Compost.m[match(sample_names(Ho), rownames(Ho.Compost.m)),]
+Ho.Compost=Ho
+Ho.Compost@sam_data=sample_data(Ho.Compost.m)
+Ho.Compost=subset_samples(Ho.Compost,Ho.Compost@sam_data$Keep!="FALSE"&Ho.Compost@sam_data$Disturbance!="Control")
+sample_names(Ho.Compost) <- paste0("Ho.Compost",1:nsamples(Ho.Compost))
+Ho.Compost@sam_data$Time_since_dist=as.numeric(Ho.Compost@sam_data$Time_since_dist)
+
+Ho.Wood.Material.m=read.table("Data/Ho_Wood_material_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Ho.Wood.Material.m=Ho.Wood.Material.m[match(sample_names(Ho), rownames(Ho.Wood.Material.m)),]
+Ho.Wood.Material=Ho
+Ho.Wood.Material@sam_data=sample_data(Ho.Wood.Material.m)
+Ho.Wood.Material=subset_samples(Ho.Wood.Material,Ho.Wood.Material@sam_data$Keep!="FALSE"&Ho.Wood.Material@sam_data$Disturbance!="Control")
+sample_names(Ho.Wood.Material) <- paste0("Ho.Wood.Material",1:nsamples(Ho.Wood.Material))
+Ho.Wood.Material@sam_data$Time_since_dist=as.numeric(Ho.Wood.Material@sam_data$Time_since_dist)
+
+Ho.Compressed.Beet.Leaves.m=read.table("Data/Ho_Compressed_beet_leaves_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Ho.Compressed.Beet.Leaves.m=Ho.Compressed.Beet.Leaves.m[match(sample_names(Ho), rownames(Ho.Compressed.Beet.Leaves.m)),]
+Ho.Compressed.Beet.Leaves=Ho
+Ho.Compressed.Beet.Leaves@sam_data=sample_data(Ho.Compressed.Beet.Leaves.m)
+Ho.Compressed.Beet.Leaves=subset_samples(Ho.Compressed.Beet.Leaves,Ho.Compressed.Beet.Leaves@sam_data$Keep!="FALSE"&Ho.Compressed.Beet.Leaves@sam_data$Disturbance!="Control")
+sample_names(Ho.Compressed.Beet.Leaves) <- paste0("Ho.Compressed.Beet.Leaves",1:nsamples(Ho.Compressed.Beet.Leaves))
+Ho.Compressed.Beet.Leaves@sam_data$Time_since_dist=as.numeric(Ho.Compressed.Beet.Leaves@sam_data$Time_since_dist)
+
+Ho.Paper.Pulp.m=read.table("Data/Ho_Paper_Pulp_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Ho.Paper.Pulp.m=Ho.Paper.Pulp.m[match(sample_names(Ho), rownames(Ho.Paper.Pulp.m)),]
+Ho.Paper.Pulp=Ho
+Ho.Paper.Pulp@sam_data=sample_data(Ho.Paper.Pulp.m)
+Ho.Paper.Pulp=subset_samples(Ho.Paper.Pulp,Ho.Paper.Pulp@sam_data$Keep!="FALSE"&Ho.Paper.Pulp@sam_data$Disturbance!="Control")
+sample_names(Ho.Paper.Pulp) <- paste0("Ho.Paper.Pulp",1:nsamples(Ho.Paper.Pulp))
+Ho.Paper.Pulp@sam_data$Time_since_dist=as.numeric(Ho.Paper.Pulp@sam_data$Time_since_dist)
+
+Jurburg_Microcosm=readRDS("Data/Jurburg_microcosm.merged.rds")
+Jurburg_Microcosm.m=read.table("Data/Jurburg_Microcosm_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Jurburg_Microcosm@sam_data=sample_data(Jurburg_Microcosm.m)
+Jurburg_Microcosm=subset_samples(Jurburg_Microcosm, Jurburg_Microcosm@sam_data$Keep!="FALSE"&Jurburg_Microcosm@sam_data$Disturbance!="Control")
+if (min(sample_sums(Jurburg_Microcosm))<1500){
+  Jurburg_Microcosm=rarefy_even_depth(Jurburg_Microcosm, 1500, rngseed = 1)
+  } else {
+    Jurburg_Microcosm=rarefy_even_depth(Jurburg_Microcosm, min(sample_sums(Jurburg_Microcosm)), rngseed = 1)}
+Jurburg_Microcosm@sam_data$Time_since_dist=as.numeric(Jurburg_Microcosm@sam_data$Time_since_dist)
+
+Jurburg_Portugal=readRDS("Data/Jurburg_portugal.merged.rds")
+Jurburg_Portugal.m=read.table("Data/Jurburg_Portugal_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Jurburg_Portugal@sam_data=sample_data(Jurburg_Portugal.m)
+Jurburg_Portugal=subset_samples(Jurburg_Portugal, Jurburg_Portugal@sam_data$Keep!="FALSE"&Jurburg_Portugal@sam_data$Disturbance!="Control"&Jurburg_Portugal@sam_data$Time_since_dist>-1)
+if (min(sample_sums(Jurburg_Portugal))<1500){
+  Jurburg_Portugal=rarefy_even_depth(Jurburg_Portugal, 1500, rngseed = 1)
+  } else {
+    Jurburg_Portugal=rarefy_even_depth(Jurburg_Portugal, min(sample_sums(Jurburg_Portugal)), rngseed = 1)}
+Jurburg_Portugal@sam_data$Time_since_dist=as.numeric(Jurburg_Portugal@sam_data$Time_since_dist)
+
+Jurburg_Pig=readRDS("Data/Jurburg_Pig.merged.rds")
+Jurburg_Pig.m=read.table("Data/Jurburg_Pigs_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Jurburg_Pig.m=Jurburg_Pig.m[match(sample_names(Jurburg_Pig), rownames(Jurburg_Pig.m)),]
+Jurburg_Pig@sam_data=sample_data(Jurburg_Pig.m)
+Jurburg_Pig=prune_samples(Jurburg_Pig@sam_data$Keep!="FALSE" & Jurburg_Pig@sam_data$Disturbance!="g"&Jurburg_Pig@sam_data$Disturbance!="Control", Jurburg_Pig)
+if (min(sample_sums(Jurburg_Pig))<1500){
+  Jurburg_Pig=rarefy_even_depth(Jurburg_Pig, 1500, rngseed = 1)
+  } else {
+    Jurburg_Pig=rarefy_even_depth(Jurburg_Pig, min(sample_sums(Jurburg_Pig)), rngseed = 1)}
+Jurburg_Pig@sam_data$Time_since_dist=as.numeric(Jurburg_Pig@sam_data$Time_since_dist)
+
+Kennedy=readRDS("Data/Kennedy.merged.rds")
+Kennedy=phyloseq(Kennedy@otu_table, Kennedy@tax_table, Kennedy@sam_data)
+sample_names(Kennedy)=substr(sample_names(Kennedy), 1,10)
+if (min(sample_sums(Kennedy))<1500){
+  Kennedy=rarefy_even_depth(Kennedy, 1500, rngseed = 1)
+  } else {
+    Kennedy=rarefy_even_depth(Kennedy, min(sample_sums(Kennedy)), rngseed = 1)}
+Kennedy0.2.m=read.table("Data/Kennedy_Meta0.2.txt", sep="\t", row.names=1, header=TRUE)
+Kennedy0.2.m=Kennedy0.2.m[match(sample_names(Kennedy), rownames(Kennedy0.2.m)),]
+Kennedy0.2=Kennedy
+Kennedy0.2@sam_data=sample_data(Kennedy0.2.m)
+Kennedy0.2=prune_samples(Kennedy0.2@sam_data$Keep!="FALSE"&Kennedy0.2@sam_data$Disturbance!="Control", Kennedy0.2)
+sample_names(Kennedy0.2) <- paste0("Kennedy0.2",1:nsamples(Kennedy0.2))
+Kennedy0.2@sam_data$Time_since_dist=as.numeric(Kennedy0.2@sam_data$Time_since_dist)
+
+Kennedy0.5.m=read.table("Data/Kennedy_Meta0.5.txt", sep="\t", row.names=1, header=TRUE)
+Kennedy0.5.m=Kennedy0.5.m[match(sample_names(Kennedy), rownames(Kennedy0.5.m)),]
+Kennedy0.5=Kennedy
+Kennedy0.5@sam_data=sample_data(Kennedy0.5.m)
+Kennedy0.5=prune_samples(Kennedy0.5@sam_data$Keep!="FALSE"&Kennedy0.5@sam_data$Disturbance!="Control", Kennedy0.5)
+sample_names(Kennedy0.5) <- paste0("Kennedy0.5",1:nsamples(Kennedy0.5))
+Kennedy0.5@sam_data$Time_since_dist=as.numeric(Kennedy0.5@sam_data$Time_since_dist)
+
+Khan=readRDS("Data/Khan.merged.rds")
+Khan.m=read.table("Data/Khan_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Khan@sam_data=sample_data(Khan.m)
+Khan=phyloseq(Khan@otu_table, Khan@tax_table, Khan@sam_data)
+Khan=prune_samples(Khan@sam_data$Keep!="FALSE"&Khan@sam_data$Disturbance!="Control", Khan)
+if (min(sample_sums(Khan))<1500){
+  Khan=rarefy_even_depth(Khan, 1500, rngseed = 1)
+  } else {
+    Khan=rarefy_even_depth(Khan, min(sample_sums(Khan)), rngseed = 1)}
+Khan@sam_data$Time_since_dist=as.numeric(Khan@sam_data$Time_since_dist)
+
+Kruistuim=readRDS("Data/Kruistuim.merged.rds")
+Kruistuim.m=read.table("Data/Kruistuim_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Kruistuim@sam_data=sample_data(Kruistuim.m)
+Kruistuim=phyloseq(Kruistuim@otu_table, Kruistuim@tax_table, Kruistuim@sam_data)
+Kruistuim=prune_samples(Kruistuim@sam_data$Keep!="FALSE"&Kruistuim@sam_data$Disturbance!="Control", Kruistuim)
+if (min(sample_sums(Kruistuim))<1500){
+  Kruistuim=rarefy_even_depth(Kruistuim, 1500, rngseed = 1)
+  } else {
+    Kruistuim=rarefy_even_depth(Kruistuim, min(sample_sums(Kruistuim)), rngseed = 1)}
+Kruistuim@sam_data$Time_since_dist=as.numeric(Kruistuim@sam_data$Time_since_dist)
+
+Lavelle=readRDS("Data/Lavelle.merged.rds")
+Lavelle.m=read.table("Data/Lavelle_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Lavelle@sam_data=sample_data(Lavelle.m)
+Lavelle=phyloseq(Lavelle@otu_table, Lavelle@tax_table, Lavelle@sam_data)
+Lavelle=prune_samples(Lavelle@sam_data$Keep!="FALSE"&Lavelle@sam_data$Disturbance!="Control", Lavelle)
+if (min(sample_sums(Lavelle))<1500){
+  Lavelle=rarefy_even_depth(Lavelle, 1500, rngseed = 1)
+  } else {
+    Lavelle=rarefy_even_depth(Lavelle, min(sample_sums(Lavelle)), rngseed = 1)}
+Lavelle@sam_data$Time_since_dist=as.numeric(Lavelle@sam_data$Time_since_dist)
+
+Li=readRDS("Data/Li.merged.rds")
+if (min(sample_sums(Li))<1500){
+  Li=rarefy_even_depth(Li, 1500, rngseed = 1)
+  } else {
+    Li=rarefy_even_depth(Li, min(sample_sums(Li)), rngseed = 1)}
+Li_Biochar.m=read.table("Data/Li_Biochar_Meta.txt", sep="\t", header = TRUE, row.names = 1)
+Li_Biochar.m=Li_Biochar.m[match(sample_names(Li), rownames(Li_Biochar.m)),]
+Li_Biochar=Li
+Li_Biochar=phyloseq(Li_Biochar@otu_table, Li_Biochar@tax_table, sample_data(Li_Biochar.m))
+Li_Biochar=prune_samples(Li_Biochar@sam_data$Keep!="FALSE"&Li_Biochar@sam_data$Disturbance!="Control"&Li_Biochar@sam_data$Disturbance!="Pseudomonas_MBR", Li_Biochar)
+sample_names(Li_Biochar) <- paste0("Li_Biochar",1:nsamples(Li_Biochar))
+Li_Biochar@sam_data$Time_since_dist=as.numeric(Li_Biochar@sam_data$Time_since_dist)
+
+Li_Pseudomonas.m=read.table("Data/Li_Pseudomonas_Meta.txt", sep="\t", header = TRUE, row.names = 1)
+Li_Pseudomonas.m=Li_Pseudomonas.m[match(sample_names(Li), rownames(Li_Pseudomonas.m)),]
+Li_Pseudomonas=Li
+Li_Pseudomonas=phyloseq(Li_Pseudomonas@otu_table, Li_Pseudomonas@tax_table, sample_data(Li_Pseudomonas.m))
+Li_Pseudomonas=prune_samples(Li_Pseudomonas@sam_data$Keep!="FALSE"&Li_Pseudomonas@sam_data$Disturbance!="Control"&Li_Pseudomonas@sam_data$Disturbance!="Biochar", Li_Pseudomonas)
+sample_names(Li_Pseudomonas) <- paste0("Li_Pseudomonas",1:nsamples(Li_Pseudomonas))
+Li_Pseudomonas@sam_data$Time_since_dist=as.numeric(Li_Pseudomonas@sam_data$Time_since_dist)
+
+
+Li2019=readRDS("Data/Li2019.merged.rds")
+if (min(sample_sums(Li2019))<1500){
+  Li2019=rarefy_even_depth(Li2019, 1500, rngseed = 1)
+  } else {
+    Li2019=rarefy_even_depth(Li2019, min(sample_sums(Li2019)), rngseed = 1)}
+Li2019.0.15.m=read.table("Data/Li2019_0.15gHumicAcid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Li2019.0.15.m=Li2019.0.15.m[match(sample_names(Li2019), rownames(Li2019.0.15.m)),]
+Li2019.0.15=Li2019
+Li2019.0.15@sam_data=sample_data(Li2019.0.15.m)
+Li2019.0.15=subset_samples(Li2019.0.15,Li2019.0.15@sam_data$Keep!="FALSE"&Li2019.0.15@sam_data$Disturbance!="Control")
+sample_names(Li2019.0.15) <- paste0("Li2019.0.15",1:nsamples(Li2019.0.15))
+Li2019.0.15@sam_data$Time_since_dist=as.numeric(Li2019.0.15@sam_data$Time_since_dist)
+
+Li2019.0.3.m=read.table("Data/Li2019_0.3gHumicAcid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Li2019.0.3.m=Li2019.0.3.m[match(sample_names(Li2019), rownames(Li2019.0.3.m)),]
+Li2019.0.3=Li2019
+Li2019.0.3@sam_data=sample_data(Li2019.0.3.m)
+Li2019.0.3=subset_samples(Li2019.0.3,Li2019.0.3@sam_data$Keep!="FALSE"&Li2019.0.3@sam_data$Disturbance!="Control")
+sample_names(Li2019.0.3) <- paste0("Li2019.0.3",1:nsamples(Li2019.0.3))
+Li2019.0.3@sam_data$Time_since_dist=as.numeric(Li2019.0.3@sam_data$Time_since_dist)
+
+Li2019.0.6.m=read.table("Data/Li2019_0.6gHumicAcid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Li2019.0.6.m=Li2019.0.6.m[match(sample_names(Li2019), rownames(Li2019.0.6.m)),]
+Li2019.0.6=Li2019
+Li2019.0.6@sam_data=sample_data(Li2019.0.6.m)
+Li2019.0.6=subset_samples(Li2019.0.6,Li2019.0.6@sam_data$Keep!="FALSE"&Li2019.0.6@sam_data$Disturbance!="Control")
+sample_names(Li2019.0.6) <- paste0("Li2019.0.6",1:nsamples(Li2019.0.6))
+Li2019.0.6@sam_data$Time_since_dist=as.numeric(Li2019.0.6@sam_data$Time_since_dist)
+
+Li2019.0.9.m=read.table("Data/Li2019_0.9gHumicAcid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Li2019.0.9.m=Li2019.0.9.m[match(sample_names(Li2019), rownames(Li2019.0.9.m)),]
+Li2019.0.9=Li2019
+Li2019.0.9@sam_data=sample_data(Li2019.0.9.m)
+Li2019.0.9=subset_samples(Li2019.0.9,Li2019.0.9@sam_data$Keep!="FALSE"&Li2019.0.9@sam_data$Disturbance!="Control")
+sample_names(Li2019.0.9) <- paste0("Li2019.0.9",1:nsamples(Li2019.0.9))
+Li2019.0.9@sam_data$Time_since_dist=as.numeric(Li2019.0.9@sam_data$Time_since_dist)
+
+Li2019.1.2.m=read.table("Data/Li2019_1.2gHumicAcid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Li2019.1.2.m=Li2019.1.2.m[match(sample_names(Li2019), rownames(Li2019.1.2.m)),]
+Li2019.1.2=Li2019
+Li2019.1.2@sam_data=sample_data(Li2019.1.2.m)
+Li2019.1.2=subset_samples(Li2019.1.2,Li2019.1.2@sam_data$Keep!="FALSE"&Li2019.1.2@sam_data$Disturbance!="Control")
+sample_names(Li2019.1.2) <- paste0("Li2019.1.2",1:nsamples(Li2019.1.2))
+Li2019.1.2@sam_data$Time_since_dist=as.numeric(Li2019.1.2@sam_data$Time_since_dist)
+
+Li2019.1.5.m=read.table("Data/Li2019_1.5gHumicAcid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Li2019.1.5.m=Li2019.1.5.m[match(sample_names(Li2019), rownames(Li2019.1.5.m)),]
+Li2019.1.5=Li2019
+Li2019.1.5@sam_data=sample_data(Li2019.1.5.m)
+Li2019.1.5=subset_samples(Li2019.1.5,Li2019.1.5@sam_data$Keep!="FALSE"&Li2019.1.5@sam_data$Disturbance!="Control")
+sample_names(Li2019.1.5) <- paste0("Li2019.1.5",1:nsamples(Li2019.1.5))
+Li2019.1.5@sam_data$Time_since_dist=as.numeric(Li2019.1.5@sam_data$Time_since_dist)
+
+Li2019.1.8.m=read.table("Data/Li2019_1.8gHumicAcid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Li2019.1.8.m=Li2019.1.8.m[match(sample_names(Li2019), rownames(Li2019.1.8.m)),]
+Li2019.1.8=Li2019
+Li2019.1.8@sam_data=sample_data(Li2019.1.8.m)
+Li2019.1.8=subset_samples(Li2019.1.8,Li2019.1.8@sam_data$Keep!="FALSE"&Li2019.1.8@sam_data$Disturbance!="Control")
+sample_names(Li2019.1.8) <- paste0("Li2019.1.8",1:nsamples(Li2019.1.8))
+Li2019.1.8@sam_data$Time_since_dist=as.numeric(Li2019.1.8@sam_data$Time_since_dist)
+
+Lu=readRDS("Data/Lu.merged.rds")
+if (min(sample_sums(Lu))<1500){
+  Lu=rarefy_even_depth(Lu, 1500, rngseed = 1)
+  } else {
+    Lu=rarefy_even_depth(Lu, min(sample_sums(Lu)), rngseed = 1)}
+Lu.Azo.m=read.table("Data/Lu_Azo_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Lu.Azo.m=Lu.Azo.m[match(sample_names(Lu), rownames(Lu.Azo.m)),]
+Lu.Azo=Lu
+Lu.Azo@sam_data=sample_data(Lu.Azo.m)
+Lu.Azo=subset_samples(Lu.Azo,Lu.Azo@sam_data$Keep!="FALSE"&Lu.Azo@sam_data$Disturbance!="Control")
+sample_names(Lu.Azo) <- paste0("Lu.Azo",1:nsamples(Lu.Azo))
+Lu.Azo@sam_data$Time_since_dist=as.numeric(Lu.Azo@sam_data$Time_since_dist)
+
+Lu.Pyr.m=read.table("Data/Lu_Pyr_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Lu.Pyr=Lu
+Lu.Pyr@sam_data=sample_data(Lu.Pyr.m)
+Lu.Pyr=subset_samples(Lu.Pyr,Lu.Pyr@sam_data$Keep!="FALSE"&Lu.Pyr@sam_data$Disturbance!="Control")
+sample_names(Lu.Pyr) <- paste0("Lu.Pyr",1:nsamples(Lu.Pyr))
+Lu.Pyr@sam_data$Time_since_dist=as.numeric(Lu.Pyr@sam_data$Time_since_dist)
+
+
+Mateos=readRDS("Data/Mateos.merged.rds")
+Mateos.m=read.table("Data/Mateos_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Mateos@sam_data=sample_data(Mateos.m)
+Mateos=phyloseq(Mateos@otu_table, Mateos@tax_table, Mateos@sam_data)
+Mateos=prune_samples(Mateos@sam_data$Keep!="FALSE"&Mateos@sam_data$Disturbance!="Control", Mateos)
+if (min(sample_sums(Mateos))<1500){
+  Mateos=rarefy_even_depth(Mateos, 1500, rngseed = 1)
+  } else {
+    Mateos=rarefy_even_depth(Mateos, min(sample_sums(Mateos)), rngseed = 1)}
+Mateos@sam_data$Time_since_dist=as.numeric(Mateos@sam_data$Time_since_dist)
+
+Overholt=readRDS("Data/Overholt.merged.rds")
+Overholt.m=read.table("Data/Overholt_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Overholt@sam_data=sample_data(Overholt.m)
+Overholt=phyloseq(Overholt@otu_table, Overholt@tax_table, Overholt@sam_data)
+Overholt=prune_samples(Overholt@sam_data$Keep!="FALSE"&Overholt@sam_data$Disturbance!="Control", Overholt)
+if (min(sample_sums(Overholt))<1500){
+  Overholt=rarefy_even_depth(Overholt, 1500, rngseed = 1)
+  } else {
+    Overholt=rarefy_even_depth(Overholt, min(sample_sums(Overholt)), rngseed = 1)}
+Overholt@sam_data$Time_since_dist=as.numeric(Overholt@sam_data$Time_since_dist)
+
+
+Qian=readRDS("Data/Qian.merged.rds")
+if (min(sample_sums(Qian))<1500){
+  Qian=rarefy_even_depth(Qian, 1500, rngseed = 1)
+  } else {
+    Qian=rarefy_even_depth(Qian, min(sample_sums(Qian)), rngseed = 1)}
+Qian=phyloseq(Qian@otu_table, Qian@tax_table, Qian@sam_data)
+Qian.PAH.m=read.table("Data/Qian_PAH_Meta.txt", sep="\t", row.names=1, header=TRUE)
+row.names(Qian.PAH.m)=substr(row.names(Qian.PAH.m), 1,9)
+Qian.PAH.m=Qian.PAH.m[match(sample_names(Qian), rownames(Qian.PAH.m)),]
+Qian.PAH=Qian
+Qian.PAH@sam_data=sample_data(Qian.PAH.m)
+Qian.PAH=prune_samples(Qian.PAH@sam_data$Keep!="FALSE"&Qian.PAH@sam_data$Disturbance!="Control", Qian.PAH)
+sample_names(Qian.PAH) <- paste0("Qian.PAH",1:nsamples(Qian.PAH))
+Qian.PAH@sam_data$Time_since_dist=as.numeric(Qian.PAH@sam_data$Time_since_dist)
+
+Qian.CadmiumPAH.m=read.table("Data/Qian_CadmiumPAH_Meta.txt", sep="\t", row.names=1, header=TRUE)
+row.names(Qian.CadmiumPAH.m)=substr(row.names(Qian.CadmiumPAH.m), 1,9)
+Qian.CadmiumPAH.m=Qian.CadmiumPAH.m[match(sample_names(Qian), rownames(Qian.CadmiumPAH.m)),]
+Qian.CadmiumPAH=Qian
+Qian.CadmiumPAH@sam_data=sample_data(Qian.CadmiumPAH.m)
+Qian.CadmiumPAH=prune_samples(Qian.CadmiumPAH@sam_data$Keep!="FALSE"&Qian.CadmiumPAH@sam_data$Disturbance!="Control", Qian.CadmiumPAH)
+sample_names(Qian.CadmiumPAH) <- paste0("Qian.CadmiumPAH",1:nsamples(Qian.CadmiumPAH))
+Qian.CadmiumPAH@sam_data$Time_since_dist=as.numeric(Qian.CadmiumPAH@sam_data$Time_since_dist)
+
+Santi=readRDS("Data/Santi.merged.rds")
+Santi.m=read.table("Data/Santi_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Santi@sam_data=sample_data(Santi.m)
+Santi=phyloseq(Santi@otu_table, Santi@tax_table, Santi@sam_data)
+Santi=prune_samples(Santi@sam_data$Keep!="FALSE"&Santi@sam_data$Disturbance!="Control", Santi)
+if (min(sample_sums(Santi))<1500){
+  Santi=rarefy_even_depth(Santi, 1500, rngseed = 1)
+  } else {
+    Santi=rarefy_even_depth(Santi, min(sample_sums(Santi)), rngseed = 1)}
+Santi@sam_data$Time_since_dist=as.numeric(Santi@sam_data$Time_since_dist)
+
+Seekatz=readRDS("Data/Seekatz.merged.rds")
+sample_names(Seekatz)=substr(sample_names(Seekatz), 1,10)
+Seekatz=phyloseq(Seekatz@otu_table, Seekatz@tax_table, Seekatz@sam_data)
+if (min(sample_sums(Seekatz))<1500){
+  Seekatz=rarefy_even_depth(Seekatz, 1500, rngseed = 1)
+  } else {
+    Seekatz=rarefy_even_depth(Seekatz, min(sample_sums(Seekatz)), rngseed = 1)}
+Seekatz.NL.CefVanco.m=read.table("Data/Seekatz_NoLegacy_CefVanco_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Seekatz.NL.CefVanco.m=Seekatz.NL.CefVanco.m[match(sample_names(Seekatz), rownames(Seekatz.NL.CefVanco.m)),]
+Seekatz.NL.CefVanco=Seekatz
+Seekatz.NL.CefVanco@sam_data=sample_data(Seekatz.NL.CefVanco.m)
+Seekatz.NL.CefVanco=subset_samples(Seekatz.NL.CefVanco,Seekatz.NL.CefVanco@sam_data$Keep!="FALSE"&Seekatz.NL.CefVanco@sam_data$Disturbance!="Control")
+sample_names(Seekatz.NL.CefVanco) <- paste0("Seekatz.NL.CefVanco",1:nsamples(Seekatz.NL.CefVanco))
+Seekatz.NL.CefVanco@sam_data$Time_since_dist=as.numeric(Seekatz.NL.CefVanco@sam_data$Time_since_dist)
+
+Seekatz.NL.Cef.m=read.table("Data/Seekatz_NoLegacy_Cef_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Seekatz.NL.Cef.m=Seekatz.NL.Cef.m[match(sample_names(Seekatz), rownames(Seekatz.NL.Cef.m)),]
+Seekatz.NL.Cef=Seekatz
+Seekatz.NL.Cef@sam_data=sample_data(Seekatz.NL.Cef.m)
+Seekatz.NL.Cef=subset_samples(Seekatz.NL.Cef, Seekatz.NL.Cef@sam_data$Keep!="FALSE"&Seekatz.NL.Cef@sam_data$Disturbance!="Control")
+sample_names(Seekatz.NL.Cef) <- paste0("Seekatz.NL.Cef",1:nsamples(Seekatz.NL.Cef))
+Seekatz.NL.Cef@sam_data$Time_since_dist=as.numeric(Seekatz.NL.Cef@sam_data$Time_since_dist)
+
+Seekatz.NL.CefCdiffVancoFMT.m=read.table("Data/Seekatz_NoLegacy_CefCdiffVancoFMT_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Seekatz.NL.CefCdiffVancoFMT.m=Seekatz.NL.CefCdiffVancoFMT.m[match(sample_names(Seekatz), rownames(Seekatz.NL.CefCdiffVancoFMT.m)),]
+Seekatz.NL.CefCdiffVancoFMT=Seekatz
+Seekatz.NL.CefCdiffVancoFMT@sam_data=sample_data(Seekatz.NL.CefCdiffVancoFMT.m)
+Seekatz.NL.CefCdiffVancoFMT=subset_samples(Seekatz.NL.CefCdiffVancoFMT, Seekatz.NL.CefCdiffVancoFMT@sam_data$Keep!="FALSE"&Seekatz.NL.CefCdiffVancoFMT@sam_data$Disturbance!="Control")
+sample_names(Seekatz.NL.CefCdiffVancoFMT) <- paste0("Seekatz.NL.CefCdiffVancoFMT",1:nsamples(Seekatz.NL.CefCdiffVancoFMT))
+Seekatz.NL.CefCdiffVancoFMT@sam_data$Time_since_dist=as.numeric(Seekatz.NL.CefCdiffVancoFMT@sam_data$Time_since_dist)
+
+Seekatz.NL.CefCdiff.m=read.table("Data/Seekatz_NoLegacy_CefCdiff_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Seekatz.NL.CefCdiff.m=Seekatz.NL.CefCdiff.m[match(sample_names(Seekatz), rownames(Seekatz.NL.CefCdiff.m)),]
+Seekatz.NL.CefCdiff=Seekatz
+Seekatz.NL.CefCdiff@sam_data=sample_data(Seekatz.NL.CefCdiff.m)
+Seekatz.NL.CefCdiff=subset_samples(Seekatz.NL.CefCdiff,Seekatz.NL.CefCdiff@sam_data$Keep!="FALSE"&Seekatz.NL.CefCdiff@sam_data$Disturbance!="Control")
+sample_names(Seekatz.NL.CefCdiff) <- paste0("Seekatz.NL.CefCdiff",1:nsamples(Seekatz.NL.CefCdiff))
+Seekatz.NL.CefCdiff@sam_data$Time_since_dist=as.numeric(Seekatz.NL.CefCdiff@sam_data$Time_since_dist)
+
+Seekatz.NL.CefCdiffVanco.m=read.table("Data/Seekatz_NoLegacy_CefCdiffVanco_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Seekatz.NL.CefCdiffVanco.m=Seekatz.NL.CefCdiffVanco.m[match(sample_names(Seekatz), rownames(Seekatz.NL.CefCdiffVanco.m)),]
+Seekatz.NL.CefCdiffVanco=Seekatz
+Seekatz.NL.CefCdiffVanco@sam_data=sample_data(Seekatz.NL.CefCdiffVanco.m)
+Seekatz.NL.CefCdiffVanco=subset_samples(Seekatz.NL.CefCdiffVanco, Seekatz.NL.CefCdiffVanco@sam_data$Keep!="FALSE"&Seekatz.NL.CefCdiffVanco@sam_data$Disturbance!="Control")
+sample_names(Seekatz.NL.CefCdiffVanco) <- paste0("Seekatz.NL.CefCdiffVanco",1:nsamples(Seekatz.NL.CefCdiffVanco))
+Seekatz.NL.CefCdiffVanco@sam_data$Time_since_dist=as.numeric(Seekatz.NL.CefCdiffVanco@sam_data$Time_since_dist)
+
+Vaquer=readRDS("Data/Vaquer.merged.rds")
+Vaquer=phyloseq(Vaquer@otu_table, Vaquer@tax_table, Vaquer@sam_data)
+sample_names(Vaquer)=substr(sample_names(Vaquer), 1,10)
+if (min(sample_sums(Vaquer))<1500){
+  Vaquer=rarefy_even_depth(Vaquer, 1500, rngseed = 1)
+  } else {
+    Vaquer=rarefy_even_depth(Vaquer, min(sample_sums(Vaquer)), rngseed = 1)}
+Vaquer_IN.m=read.table("Data/Vaquer_Meta_IN.txt", sep="\t", row.names=1, header=TRUE)
+Vaquer_IN.m=Vaquer_IN.m[match(sample_names(Vaquer), rownames(Vaquer_IN.m)),]
+Vaquer_IN=Vaquer
+Vaquer_IN@sam_data=sample_data(Vaquer_IN.m)
+Vaquer_IN=prune_samples(Vaquer_IN@sam_data$Keep!="FALSE"&Vaquer_IN@sam_data$Disturbance!="Control", Vaquer_IN)
+sample_names(Vaquer_IN) <- paste0("Vaquer_IN",1:nsamples(Vaquer_IN))
+Vaquer_IN@sam_data$Time_since_dist=as.numeric(Vaquer_IN@sam_data$Time_since_dist)
+
+Vaquer_wwt1_5.m=read.table("Data/Vaquer_Meta_wwt1_5.txt", sep="\t", row.names=1, header=TRUE)
+Vaquer_wwt1_5.m=Vaquer_wwt1_5.m[match(sample_names(Vaquer), rownames(Vaquer_wwt1_5.m)),]
+Vaquer_wwt1_5=Vaquer
+Vaquer_wwt1_5@sam_data=sample_data(Vaquer_wwt1_5.m)
+Vaquer_wwt1_5=prune_samples(Vaquer_wwt1_5@sam_data$Keep!="FALSE"&Vaquer_wwt1_5@sam_data$Disturbance!="Control", Vaquer_wwt1_5)
+sample_names(Vaquer_wwt1_5) <- paste0("Vaquer_wwt1_5",1:nsamples(Vaquer_wwt1_5))
+Vaquer_wwt1_5@sam_data$Time_since_dist=as.numeric(Vaquer_wwt1_5@sam_data$Time_since_dist)
+
+Vaquer_wwt1_10.m=read.table("Data/Vaquer_Meta_wwt1_10.txt", sep="\t", row.names=1, header=TRUE)
+Vaquer_wwt1_10.m=Vaquer_wwt1_10.m[match(sample_names(Vaquer), rownames(Vaquer_wwt1_10.m)),]
+Vaquer_wwt1_10=Vaquer
+Vaquer_wwt1_10@sam_data=sample_data(Vaquer_wwt1_10.m)
+Vaquer_wwt1_10=prune_samples(Vaquer_wwt1_10@sam_data$Keep!="FALSE"&Vaquer_wwt1_10@sam_data$Disturbance!="Control", Vaquer_wwt1_10)
+sample_names(Vaquer_wwt1_10) <- paste0("Vaquer_wwt1_10",1:nsamples(Vaquer_wwt1_10))
+Vaquer_wwt1_10@sam_data$Time_since_dist=as.numeric(Vaquer_wwt1_10@sam_data$Time_since_dist)
+
+Venkataraman=readRDS("Data/Venkataraman.merged.rds")
+Venkataraman.m=read.table("Data/Venkataraman_Meta.txt", sep="\t", row.names=1, header=TRUE)
+sample_names(Venkataraman)=substr(sample_names(Venkataraman), 1,10)
+Venkataraman@sam_data=sample_data(Venkataraman.m)
+Venkataraman=phyloseq(Venkataraman@otu_table, Venkataraman@tax_table, Venkataraman@sam_data)
+Venkataraman=prune_samples(Venkataraman@sam_data$Keep!="FALSE"&Venkataraman@sam_data$Disturbance!="Control" &Venkataraman@sam_data$Time_since_dist>-2, Venkataraman)
+if (min(sample_sums(Venkataraman))<1500){
+  Venkataraman=rarefy_even_depth(Venkataraman, 1500, rngseed = 1)
+  } else {
+    Venkataraman=rarefy_even_depth(Venkataraman, min(sample_sums(Venkataraman)), rngseed = 1)}
+Venkataraman@sam_data$Time_since_dist=as.numeric(Venkataraman@sam_data$Time_since_dist)
+
+Ward=readRDS("Data/Ward.merged.rds")
+Ward.m=read.table("Data/Ward_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Ward@sam_data=sample_data(Ward.m)
+Ward=phyloseq(Ward@otu_table, Ward@tax_table, Ward@sam_data)
+Ward=prune_samples(Ward@sam_data$Keep!="FALSE"&Ward@sam_data$Disturbance!="Control", Ward)
+if (min(sample_sums(Ward))<1500){
+  Ward=rarefy_even_depth(Ward, 1500, rngseed = 1)
+  } else {
+    Ward=rarefy_even_depth(Ward, min(sample_sums(Ward)), rngseed = 1)}
+Ward@sam_data$Time_since_dist=as.numeric(Ward@sam_data$Time_since_dist)
+
+Wu=readRDS("Data/Wu.merged.rds")
+Wu=phyloseq(Wu@otu_table, Wu@tax_table, Wu@sam_data)
+if (min(sample_sums(Wu))<1500){
+  Wu=rarefy_even_depth(Wu, 1500, rngseed = 1)
+  } else {
+    Wu=rarefy_even_depth(Wu, min(sample_sums(Wu)), rngseed = 1)}
+Wu.Solid.m=read.table("Data/Wu_Solid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Wu.Solid.m=Wu.Solid.m[match(sample_names(Wu), rownames(Wu.Solid.m)),]
+Wu.Solid=Wu
+Wu.Solid@sam_data=sample_data(Wu.Solid.m)
+Wu.Solid=prune_samples(Wu.Solid@sam_data$Keep!="FALSE"&Wu.Solid@sam_data$Disturbance!="Control", Wu.Solid)
+sample_names(Wu.Solid) <- paste0("Wu.Solid",1:nsamples(Wu.Solid))
+Wu.Solid@sam_data$Time_since_dist=as.numeric(Wu.Solid@sam_data$Time_since_dist)
+
+Wu.Liquid.m=read.table("Data/Wu_Liquid_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Wu.Liquid.m=Wu.Liquid.m[match(sample_names(Wu), rownames(Wu.Liquid.m)),]
+Wu.Liquid=Wu
+Wu.Liquid@sam_data=sample_data(Wu.Liquid.m)
+Wu.Liquid=prune_samples(Wu.Liquid@sam_data$Keep!="FALSE"&Wu.Liquid@sam_data$Disturbance!="Control", Wu.Liquid)
+sample_names(Wu.Liquid) <- paste0("Wu.Liquid",1:nsamples(Wu.Liquid))
+Wu.Liquid@sam_data$Time_since_dist=as.numeric(Wu.Liquid@sam_data$Time_since_dist)
+
+Yan=readRDS("Data/Yan.merged.rds")
+Yan.m=read.table("Data/Yan_Meta.txt", sep="\t", row.names=1, header=TRUE)
+Yan@sam_data=sample_data(Yan.m)
+Yan=phyloseq(Yan@otu_table, Yan@tax_table, Yan@sam_data)
+Yan=prune_samples(Yan@sam_data$Keep!="FALSE"&Yan@sam_data$Disturbance!="Control", Yan)
+if (min(sample_sums(Yan))<1500){
+  Yan=rarefy_even_depth(Yan, 1500, rngseed = 1)
+  } else {
+    Yan=rarefy_even_depth(Yan, min(sample_sums(Yan)), rngseed = 1)}
+Yan@sam_data$Time_since_dist=as.numeric(Yan@sam_data$Time_since_dist)
+
+```
+
+#UNITE!
+Merge all phyloseq objects together, then remove the original data
+```{r}
+merged=merge_phyloseq(
+  Datta,
+  David,
+  deVries,
+  Dong,
+  Dzunkova,
+  Flancman,
+  Frenk,
+  Fuentes_Diesel,
+  Fuentes_Bact1,
+  Fuentes_Bact2,
+  Ho.Aquatic.Plant.Material,
+  Ho.Compost,
+  Ho.Compressed.Beet.Leaves,
+  Ho.Paper.Pulp,
+  Ho.Wood.Material,
+  Jurburg_Microcosm,
+  Jurburg_Portugal,
+  Jurburg_Pig,
+  Kennedy0.5,
+  Kennedy0.2,
+  Khan,
+  Kruistuim,
+  Lavelle,
+  Li_Pseudomonas,
+  Li_Biochar,
+  Li2019.1.8,
+  Li2019.1.5,
+  Li2019.1.2,
+  Li2019.0.9,
+  Li2019.0.6,
+  Li2019.0.3,
+  Li2019.0.15,
+  Lu.Azo,
+  Lu.Pyr,
+  Mateos,
+  Overholt,
+  Qian.CadmiumPAH,
+  Qian.PAH,
+  Santi,
+  Seekatz.NL.Cef,
+  Seekatz.NL.CefCdiffVanco,
+  Seekatz.NL.CefCdiffVancoFMT,
+  Seekatz.NL.CefVanco,
+  Seekatz.NL.CefCdiff,
+  Vaquer_IN,
+  Vaquer_wwt1_5,
+  Vaquer_wwt1_10,
+  Venkataraman,
+  Ward, 
+  Wu.Solid,
+  Wu.Liquid,
+  Yan)
+
+saveRDS(merged, "merged.ecological.rds")
+
+
+rm(Datta.m,
+  David.m,
+  deVries.m,
+  Dong.m,
+  Dzunkova.m,
+  Flancman.m,
+  Frenk.m,
+  Fuentes.m,
+  Fuentes_Bact1.m,
+  Fuentes_Bact2.m,
+  Fuentes_Diesel.m,
+  Ho.Paper.Pulp.m,
+  Ho.Compost.m,
+  Ho.Compressed.Beet.Leaves.m,
+  Ho.Wood.Material.m,
+  Ho.Aquatic.Plant.Material.m,
+  Jurburg_Microcosm.m,
+  Jurburg_Portugal.m,
+  Jurburg_Pig.m,
+  Kennedy0.2.m,
+  Kennedy0.5.m,
+  Khan.m,
+  Kruistuim.m,
+  Lavelle.m,
+  Li_Biochar.m,
+  Li_Pseudomonas.m,
+  Li2019.1.8.m,
+  Li2019.1.5.m,
+  Li2019.1.2.m,
+  Li2019.0.9.m,
+  Li2019.0.6.m,
+  Li2019.0.3.m,
+  Li2019.0.15.m,
+  Lu.Azo.m,
+  Lu.Pyr.m,
+  Mateos.m,
+  Overholt.m,
+  Qian.CadmiumPAH.m,
+  Qian.PAH.m,
+  Santi.m,
+  Seekatz.NL.Cef.m,
+  Seekatz.NL.CefCdiffVanco.m,
+  Seekatz.NL.CefCdiffVancoFMT.m,
+  Seekatz.NL.CefVanco.m,
+  Seekatz.NL.CefCdiff.m,
+  Vaquer_wwt1_10.m,
+  Vaquer_wwt1_5.m,
+  Venkataraman.m,
+  Ward.m, 
+  Wu.Solid.m,
+  Wu.Liquid.m,
+  Yan.m)
+
+rm(
+  Datta,
+  David,
+  deVries,
+  Dong,
+  Dzunkova,
+  Flancman,
+  Frenk,
+  Fuentes,
+  Fuentes_Bact1,
+  Fuentes_Bact2,
+  Fuentes_Diesel,
+  Ho.Aquatic.Plant.Material,
+  Ho.Compost,
+  Ho.Compressed.Beet.Leaves,
+  Ho,
+  Ho.Paper.Pulp, 
+  Ho.Wood.Material,
+  Jurburg_Microcosm,
+  Jurburg_Portugal,
+  Jurburg_Pig,
+  Kennedy,
+  Kennedy0.2,
+  Kennedy0.5,
+  Khan,
+  Kruistuim,
+  Lavelle,
+  Li,
+  Li_Biochar,
+  Li_Pseudomonas,
+  Li2019.1.8,
+  Li2019.1.5,
+  Li2019.1.2,
+  Li2019.0.9,
+  Li2019.0.6,
+  Li2019.0.3,
+  Li2019.0.15,
+  Li2019,
+  Lu,
+  Lu.Azo,
+  Lu.Pyr,
+  Mateos,
+  Overholt,
+  Qian,
+  Qian.CadmiumPAH,
+  Qian.PAH,
+  Santi,
+  Seekatz,
+  Seekatz.NL.Cef,
+  Seekatz.NL.CefCdiffVanco,
+  Seekatz.NL.CefCdiffVancoFMT,
+  Seekatz.NL.CefVanco,
+  Seekatz.NL.CefCdiff,
+  Vaquer,
+  Vaquer_IN,
+  Vaquer_wwt1_10,
+  Vaquer_wwt1_5,
+  Venkataraman,
+  Ward, 
+  Wu,
+  Wu.Solid,
+  Wu.Liquid,
+  Yan)
+
+```
+#Load Phyloseq and clean
+```{r}
+merged=readRDS("merged.ecological.rds")
+LoR=read.table("LongitudinalOrRepeated.txt")
+
+#Homogenize levels
+levels(merged@sam_data$Environment)[levels(merged@sam_data$Environment)=="Seawater_microcosms" |levels(merged@sam_data$Environment)=="Freshwater_microcosm"]<- "Aquatic"
+
+levels(merged@sam_data$Environment)[levels(merged@sam_data$Environment)=="Soil_Microcosm"]<- "Soil"
+
+#create some handy variables
+merged@sam_data$StudyxDisturbance=with(merged@sam_data, interaction(Study, Disturbance))
+
+merged@sam_data$repID=with(merged@sam_data, interaction(StudyxDisturbance, Time_since_dist))
+
+merged@sam_data$repID=with(merged@sam_data, interaction(repID, Environment_Sub))
+
+merged@sam_data$Time_series=as.factor(paste(merged@sam_data$StudyxDisturbance, merged@sam_data$Environment_Sub, sep = "."))
+
+merged@sam_data$Time_series_Time=as.factor(paste(merged@sam_data$Time_series, merged@sam_data$Time_since_dist, sep = "."))
+
+#remove empty samples
+merged.pruned = prune_samples(sample_sums(merged) > 1, merged)
+merged.pruned=prune_samples(!is.na(merged.pruned@sam_data$Time_since_dist), merged.pruned)
+
+merged.pruned@sam_data$sample_sums=sample_sums(merged.pruned)
+
+saveRDS(merged.pruned, "merged.pruned.rerarefied.rds")
+
+ggplot(merged.pruned@sam_data, aes(x=reorder(Time_series, sample_sums, mean), y=sample_sums, color=Environment))+
+  geom_point()+
+  scale_color_viridis(discrete=TRUE)+
+   theme_classic()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  ggtitle("Reads per sample, per study")+
+  xlab("Time_series")
+  
+```
+
+
+#Information about each study
+```{r}
+expdat=cbind(merged.pruned@sam_data, 
+             Reads=as.numeric(sample_sums(merged.pruned)),
+             SVS=as.numeric(specnumber(merged.pruned@otu_table@.Data)))
+
+Studydat=cbind(totalreads=aggregate(Reads ~ Study, data = expdat, sum)$Reads,
+               meanSVs=aggregate(SVS ~ Study, data = expdat, mean)$SVS,
+               meanreads=aggregate(Reads ~ Study, data = expdat, mean)$Reads,
+               totalSVs=aggregate(SVS ~ Study, data = expdat, sum)$SVS)
+row.names(Studydat)=aggregate(Reads ~ Study, data = expdat, sum)$Study
+
+ggplot(expdat, aes(x=reorder(Study, Reads, mean), y=Reads, fill=Environment))+
+  geom_boxplot()+ 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  ggtitle("Reads Per Sample")+
+  scale_fill_viridis(discrete=TRUE)+
+   theme_classic()
+
+ ggplot(expdat, aes(x=reorder(Study, SVS, mean), y=SVS, fill=Environment))+
+   geom_boxplot()+ 
+   theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_viridis(discrete=TRUE)+
+   ggtitle("SVs Per Sample")+
+    theme_classic()
+
+ggplot(expdat, aes(x=Reads, y=SVS,color=Environment))+
+  geom_point()+
+  facet_wrap(~Environment)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_color_viridis(discrete=TRUE)+ 
+  theme_classic()
+```
+
+#Rarefy and prune experiments without replicates--> keep only one control time point per time series, the closest to disturbance with at least triplicate. 
+```{r}
+merged.pruned.r=merged.pruned
+replicates=merged.pruned.r@sam_data %>% group_by(repID) %>% tally()
+
+#Remove samples which have less than 3 replicates
+a=replicates[which(replicates$n<3),]
+merged.pruned.rp=subset_samples(merged.pruned.r, !(merged.pruned.r@sam_data$repID %in% a$repID))
+
+#remove controls that are distant from disturbance in Jurburg_Pigs
+
+
+merged.pruned.rp=prune_taxa(taxa_sums(merged.pruned.rp) >0, merged.pruned.rp)
+
+revalue(merged.pruned.rp@sam_data$Selective_Factor, c("Invader" = "Invasion")) -> merged.pruned.rp@sam_data$Selective_Factor
+ 
+revalue(merged.pruned.rp@sam_data$Selective_Factor, c("Antibiotic" = "Death")) -> merged.pruned.rp@sam_data$Selective_Factor
+
+revalue(merged.pruned.rp@sam_data$Selective_Factor, c("Antibiotic_Pathogen_Manipulation" = "Death_Invasion")) -> merged.pruned.rp@sam_data$Selective_Factor
+
+revalue(merged.pruned.rp@sam_data$Selective_Factor, c("Invader" = "Invasion")) -> merged.pruned.rp@sam_data$Selective_Factor
+
+revalue(merged.pruned.rp@sam_data$Selective_Factor, c("Antibiotic_Pathogen" = "Death_Invasion")) -> merged.pruned.rp@sam_data$Selective_Factor
+
+saveRDS(merged.pruned.rp, "merged.pruned.rp.rds")
+
+reads_per_OTU=data.frame(nreads = sort(taxa_sums(merged.pruned.rp), TRUE), sorted = 1:ntaxa(merged.pruned.rp), type = "OTUs")
+
+rpo=ggplot(data=reads_per_OTU, aes(x = sorted, y = nreads,fill=TRUE))+
+  geom_area(stat="identity")+
+  scale_x_log10()+ 
+  theme(legend.position="none")+
+  labs(x = "(log) Unique SVs", y="Reads per SVs", title="Reads per SV")
+
+
+
+rpo
+
+lilkey=as.data.frame((merged.pruned.rp@sam_data)%>%
+  group_by(Time_series)%>%
+  summarize(Study=first(Study),
+            Disturbance=first(Disturbance),
+            Environment=first(Environment)))
+
+
+
+exp=read.table("LongitudinalOrRepeated.txt", sep="\t", header=TRUE)
+
+merged.pruned.rp@sam_data$Design=exp$Experiment[match(merged.pruned.rp@sam_data$Study,exp$Study)]
+merged.pruned.rp@sam_data$nReps=replicates$n[match(merged.pruned.rp@sam_data$repID,replicates$repID)]
+
+
+  
+ggplot(merged.pruned.rp@sam_data[which(merged.pruned.rp@sam_data$Disturbance!="Control"),], aes(y=Time_series, x=Time_since_dist, color=Environment))+
+   geom_point(size=3)+
+   xlim(-5, 50)+
+   scale_color_viridis(discrete=TRUE)+
+   xlab("Time since disturbance (days)")+
+   #ggtitle(paste(nlevels(merged.pruned.rp@sam_data$Study), "studies,", nlevels(merged.pruned.rp@sam_data$Time_series), "time series"))+
+   theme_classic()+
+   scale_y_discrete("Time series",
+                labels=lilkey[which(lilkey$Disturbance!="Control"),]$Study)+
+  geom_vline(xintercept = 0.01)+
+  geom_vline(xintercept = 4, color="grey" )+
+  theme(axis.text.y=element_blank())
+  
+
+
+
+```
+
+#Venn diagram comparison of families between environments
+Inspired by https://microbiome.github.io/tutorials/core_venn.html
+```{r}
+library(microbiome)
+library(microbiomeutilities)
+Family=tax_glom(merged.pruned.rp, taxrank = "Family")
+
+table(meta(Family)$Environment, useNA = "always")
+Family.r =microbiome::transform(Family, "compositional")
+Environments = unique(as.character(meta(Family.r)$Environment))
+
+list_core <- c() # an empty object to store information
+
+for (n in Environments){ 
+    #print(paste0("Identifying Core Taxa for ", n))
+    ps.sub =subset_samples(Family.r, Environments == n) # Choose sample from Environments by n
+    core_m = core_members(ps.sub, # ps.sub is phyloseq selected with only samples from g 
+                           detection = 1/nsamples(Family.r), # 0.001 in atleast 90% samples 
+                           prevalence = 1/nsamples(Family.r))
+    print(paste0("No. of core taxa in ", n, " : ", length(core_m))) # print core taxa identified in each DiseaseState.
+    list_core[[n]] <- core_m # add to a list core taxa for each group.
+}
+
+
+
+plot(venn(list_core))
+```
+#Distance matrix
+```{r}
+#pick up a
+a=phyloseq_sep_variable(merged.pruned.rp, "Time_series", drop_zeroes = T)
+#create a list of linearized distance matrices; readjusted dissector for this purpose
+
+
+dist2listt <-function(physeq){
+        dist=dist2list(vegdist(decostand(otu_table(physeq),method = "hellinger")), tri=TRUE)
+        dist$Study=physeq@sam_data$Study[1]
+        dist$Time_series=physeq@sam_data$Time_series[1]
+        dist$Time_since_dist=physeq@sam_data$Time_since_dist[match(dist$col, sample_names(physeq))]
+        dist$Time_since_dist.=physeq@sam_data$Time_since_dist[match(dist$row, sample_names(physeq))]
+        return(dist)
+}
+
+
+bb=lapply(a, dist2listt)
+
+key=list()
+for(i in 1:length(bb)){
+  key[[i]]=data.frame(levels=as.numeric(levels(as.factor(bb[[i]]$Time_since_dist))),
+                 rank=rank(as.numeric(levels(as.factor(bb[[i]]$Time_since_dist)))))
+  bb[[i]]$Rank=key[[i]]$rank[match(bb[[i]]$Time_since_dist, key[[i]]$levels)]#rank of first Time column
+  bb[[i]]$Rank.=key[[i]]$rank[match(bb[[i]]$Time_since_dist., key[[i]]$levels)]#rank of second Time column
+}
+
+
+#merge into a single data frame, ee. 
+for(i in 1:length(bb)){
+  tmp=bb[[i]]
+  if (i>1){
+    ee.=rbind(ee., tmp)
+  } else {
+    ee.=tmp}
+}
+
+#Sanity check:
+q=as.data.frame(unlist(lapply(a, nsamples)))
+q$a=q$`unlist(lapply(a, nsamples))`^2
+q$b=(q$a-q$`unlist(lapply(a, nsamples))`)/2
+
+sum(q$b)==dim(ee.)[1]
+
+
+ee.$Disturbance=merged.pruned.rp@sam_data$Disturbance[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
+
+ee.$Time_series=merged.pruned.rp@sam_data$Time_series[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
+ee.$Time_series.=merged.pruned.rp@sam_data$Time_series[match(ee.$row,row.names(merged.pruned.rp@sam_data))]
+
+ee.$Environment=merged.pruned.rp@sam_data$Environment[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
+
+ee.$Study=merged.pruned.rp@sam_data$Study[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
+
+ee.$Experimental_unit=merged.pruned.rp@sam_data$Experimental_Unit_ID[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
+
+ee.$Experimental_unit.=merged.pruned.rp@sam_data$Experimental_Unit_ID[match(ee.$row,row.names(merged.pruned.rp@sam_data))]
+
+ee.$Selective_Factor=merged.pruned.rp@sam_data$Selective_Factor[match(ee.$row,row.names(merged.pruned.rp@sam_data))]
+
+ee.$Time_series_Time=merged.pruned.rp@sam_data$Time_series_Time[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
+
+#add rank data to the main file
+merged.pruned.rp@sam_data$Rank=ee.$Rank[match(merged.pruned.rp@sam_data$Time_series_Time,ee.$Time_series_Time,)]
+
+write.table(ee., "pairwise.table.txt")
+```
+
+#Turnover: get comparisons 
+```{r}
+# add a homogenized time
+for(i in 1:dim(ee.)[1]){
+  if (ee.$Rank.[i]>ee.$Rank[i]){
+    ee.$Time[i]=ee.$Time_since_dist.[i]}
+  else {ee.$Time[i]=ee.$Time_since_dist[i]}
+  }
+
+Resilience=ee.[which(ee.$Time_since_dist!=ee.$Time_since_dist. &
+                       (ee.$Rank==1|ee.$Rank.==1)&
+                       (ee.$Experimental_unit!=ee.$Experimental_unit.|
+                          is.na(ee.$Experimental_unit))&
+                       ee.$Time_series==ee.$Time_series.),]
+
+#Save for Shane:
+write.table(Resilience, "Resilience.txt")
+
+```
+
+
+#Dispersions: get comparisons
+```{r}
+Dispersions=ee.[which(ee.$Time_since_dist==ee.$Time_since_dist. &
+                       (ee.$Experimental_unit!=ee.$Experimental_unit.|
+                          is.na(ee.$Experimental_unit))&
+                       ee.$Time_series==ee.$Time_series.),]
+#Dispersions for Shane
+write.table(Dispersions, "dispersions.txt")
+
+
+```
+
+
+
+#Alpha diversity
+```{r}
+Rich=estimate_richness(merged.pruned.rp, measures=c("Observed", "Shannon", "Simpson"))
+Rich$Hill_Simpson=hill_taxa(comm=merged.pruned.rp@otu_table@.Data, q=2)
+Rich=cbind(Rich,merged.pruned.rp@sam_data)
+
+write.table(Rich, "Rich.txt")
+
+ggplot(Rich[which(Rich$Rank>1),], aes(x=Time_since_dist, y=Hill_Simpson, color=Disturbance))+
+  geom_point()+
+  geom_vline(xintercept = 0)+ 
+  geom_smooth(method=lm, se=F)+
+  facet_wrap(~Environment)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  theme(legend.position = "none")+
+  xlim(-0,50)+
+  theme_classic()+
+  scale_color_viridis(discrete=TRUE)
+
+
+
+   ggplot(Rich, aes(x=reorder(Time_series, Hill_Simpson, mean), y=Hill_Simpson, fill=Environment))+
+   geom_boxplot()+ 
+   ylab("ens Simpson")+
+   xlab("Time series")+
+   theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_viridis(discrete=TRUE)+
+   ggtitle("Taxonomic Diversity ")+ 
+  theme(axis.text.x = element_blank())
+   
+
+
+  ggplot(Rich[which(Rich$Time_since_dist<0.01),], aes(x=reorder(Time_series, Hill_Simpson, mean), y=Hill_Simpson, fill=Environment))+
+   geom_boxplot()+ 
+   ylab("ens Simpson")+
+   xlab("Time series")+
+   theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_viridis(discrete=TRUE)+
+   ggtitle("Taxonomic Diversity ")+ 
+  theme(axis.text.x = element_blank())
+
+```
+
