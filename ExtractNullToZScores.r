@@ -2,7 +2,7 @@
 suppressPackageStartupMessages(lapply(c('plyr','picante','ggfortify', 'psych','viridis', 'ggplot2','RColorBrewer', 'reshape2', 'ape', 'phyloseq', 'vegan', 'cowplot', 'dplyr', 'gplots', 'dada2', 'phangorn', 'data.table', 'hillR', 'betapart', 'tidyverse', 'matrixStats'), require,character.only=TRUE)) #add as necessary
 
 
-merged.pruned.rp=readRDS("merged.pruned.rp.rds")
+merged.pruned.rp=readRDS("merged.pruned.rp.rerarefied.rds")
 
 merged.pruned.rp.=phyloseq_sep_variable(merged.pruned.rp, "Time_series", drop_zeroes = FALSE)
 
