@@ -1,5 +1,5 @@
 
-suppressPackageStartupMessages(lapply(c('plyr','picante','ggfortify', 'psych','viridis', 'ggplot2','RColorBrewer', 'reshape2', 'ape', 'phyloseq', 'vegan', 'cowplot', 'dplyr', 'gplots', 'dada2', 'phangorn', 'data.table', 'hillR', 'betapart', 'tidyverse', 'Carrotworks'), require,character.only=TRUE)) #add as necessary
+suppressPackageStartupMessages(lapply(c('plyr','picante','ggfortify', 'psych','viridis', 'ggplot2','RColorBrewer', 'reshape2', 'ape', 'phyloseq', 'vegan', 'cowplot', 'dplyr', 'gplots', 'dada2', 'phangorn', 'data.table', 'hillR', 'betapart', 'tidyverse', 'matrixStats'), require,character.only=TRUE)) #add as necessary
 
 
 #Function from metagMisc https://github.com/vmikk/metagMisc/
@@ -50,9 +50,10 @@ phyloseq_sep_variable <- function(physeq, variable, drop_zeroes = T){
 }
 
 
+
 dist2list <- function (dist, tri=TRUE) {
   if (!class(dist) == "dist") { stop("Error: The input data must be a dist object.\n") }
-  
+
   dat <- as.data.frame(as.matrix(dist))
   if (is.null(names(dat))) {
     rownames(dat) <- paste(1:nrow(dat))
@@ -62,11 +63,11 @@ dist2list <- function (dist, tri=TRUE) {
   namecol <- expand.grid(rnames, rnames)
   colnames(namecol) <- c("col", "row")
   res <- data.frame(namecol, value)
-  
+
   if(tri == TRUE){    # return only lower triangular part of dist
     res <- res[-which(upper.tri(as.matrix(dist), diag = T)), ]
   }
-  
+
   return(res)
 }
 
@@ -80,16 +81,22 @@ dist2listt <-function(physeq){
   return(dist)
 }
 
-
-merged.pruned.rp=readRDS("merged.pruned.rp.rds")
-
+merged.pruned.rp=readRDS("merged.pruned.rp.rerarefied.rds")
 
 merged.pruned.rp.=phyloseq_sep_variable(merged.pruned.rp, "Time_series", drop_zeroes = FALSE)
 
+#Actual data
+bb=lapply(merged.pruned.rp., dist2listt) #a list of linearized distance matrices
 
-niter=1000 #iterations 
+key=list()
+for(i in 1:length(bb)){
+  key[[i]]=data.frame(levels=as.numeric(levels(as.factor(merged.pruned.rp.[[i]]@sam_data$Time_since_dist))),
+                 rank=rank(as.numeric(levels(as.factor(merged.pruned.rp.[[i]]@sam_data$Time_since_dist)))))
+  bb[[i]]$Rank=key[[i]]$rank[match(bb[[i]]$Time_since_dist, key[[i]]$levels)]#rank of first Time column
+  bb[[i]]$Rank.=key[[i]]$rank[match(bb[[i]]$Time_since_dist., key[[i]]$levels)]#rank of second Time column
+}
 
-bb=lapply(merged.pruned.rp., dist2listt) #convert to dataframe
+#Convert bb to data frame 
 for(i in 1:length(bb)){
   tmp=bb[[i]]
   if (i>1){
@@ -98,13 +105,14 @@ for(i in 1:length(bb)){
     ee.=tmp}
 }
 
+niter=3 #iterations 
 
 for(i in 1:niter){
   merged.pruned.rp.0=vector("list", length = length(merged.pruned.rp.) )
   for (j in 1: length (merged.pruned.rp.) ){
     #reshuffle 
     merged.pruned.rp.0[[j]]= phyloseq(otu_table(
-      picante::randomizeMatrix(merged.pruned.rp.[[j]]@otu_table@.Data, "richness", 1000), taxa_are_rows = FALSE), 
+      picante::randomizeMatrix(merged.pruned.rp.[[j]]@otu_table@.Data, "richness", niter), taxa_are_rows = FALSE), 
       tax_table(merged.pruned.rp.[[j]]@tax_table), 
       sample_data(merged.pruned.rp.[[j]]@sam_data))
   }
@@ -117,38 +125,47 @@ for(i in 1:niter){
         cc=tmp
         }
     }
-    ee.[[paste0("iter",niter)]]=cc$value
+    ee.[ , ncol(ee.) + 1] <- cc$value            
+    colnames(ee.)[ncol(ee.)] <- paste0("iter",i)
+
 }
 
 
 ee.$Disturbance=merged.pruned.rp@sam_data$Disturbance[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
-ee.$Time_series=merged.pruned.rp@sam_data$Time_series[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
-ee.$Time_series.=merged.pruned.rp@sam_data$Time_series[match(ee.$row,row.names(merged.pruned.rp@sam_data))]
 ee.$Environment=merged.pruned.rp@sam_data$Environment[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
 ee.$Study=merged.pruned.rp@sam_data$Study[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
 ee.$Experimental_unit=merged.pruned.rp@sam_data$Experimental_Unit_ID[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
 ee.$Experimental_unit.=merged.pruned.rp@sam_data$Experimental_Unit_ID[match(ee.$row,row.names(merged.pruned.rp@sam_data))]
 ee.$Selective_Factor=merged.pruned.rp@sam_data$Selective_Factor[match(ee.$row,row.names(merged.pruned.rp@sam_data))]
 ee.$Time_series_Time=merged.pruned.rp@sam_data$Time_series_Time[match(ee.$col,row.names(merged.pruned.rp@sam_data))]
-ee.$Rank=pairwise$Rank[match(ee.$col,pairwise$col)]
-ee.$Rank.=pairwise$Rank.[match(ee.$row,pairwise$row)]
 
-#add rank data to the main file
-merged.pruned.rp@sam_data$Rank=ee.$Rank[match(merged.pruned.rp@sam_data$Time_series_Time,ee.$Time_series_Time,)]
+# add a homogenized time
+for(i in 1:dim(ee.)[1]){
+if (ee.$Rank.[i]>ee.$Rank[i]){
+ee.$Time[i]=ee.$Time_since_dist.[i]}
+else {ee.$Time[i]=ee.$Time_since_dist[i]}
+}
+
+ee.$nmodel.means=rowMeans(ee.%>% select(starts_with('iter')))
+ee.$nmodel.sds=rowSds(as.matrix(ee.%>% select(starts_with('iter'))))
 
 ee.$nmodel.sds[ee.$nmodel.sds==0]<-min(ee.$nmodel.sds[ee.$nmodel.sds>0])
+
 ee.$nmodel.Zscores=(ee.$value-ee.$nmodel.means)/ee.$nmodel.sds
 
+
+write.table(ee., "allnullmodeloutputs.txt")
 
 Resilience=ee.[which(ee.$Time_since_dist!=ee.$Time_since_dist. &
                        (ee.$Rank==1|ee.$Rank.==1)&
                        (ee.$Experimental_unit!=ee.$Experimental_unit.|
-                          is.na(ee.$Experimental_unit))&
-                       ee.$Time_series==ee.$Time_series.),]
+                          is.na(ee.$Experimental_unit))),]
+
+Resilience <- Resilience %>% select(-contains("iter"))
 write.table(Resilience, "Resilience.zscores.txt")
 
 Dispersions=ee.[which(ee.$Time_since_dist==ee.$Time_since_dist. &
                         (ee.$Experimental_unit!=ee.$Experimental_unit.|
-                           is.na(ee.$Experimental_unit))&
-                        ee.$Time_series==ee.$Time_series.),]
+                           is.na(ee.$Experimental_unit))),]
+Dispersions <- Dispersions %>% select(-contains("iter"))
 write.table(Dispersions, "dispersions.zscores.txt")
